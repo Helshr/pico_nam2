@@ -1,0 +1,8 @@
+; Exact 50-percent-duty master clock for WM8978.
+.program wm8978_mclk
+.side_set 1
+
+.wrap_target
+    nop side 1
+    nop side 0
+.wrap

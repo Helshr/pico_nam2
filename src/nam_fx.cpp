@@ -41,6 +41,9 @@ static volatile uint32_t g_ack = SENTINEL;   // block index core1 has fronted
 static uint32_t g_blk = 0;
 static bool g_primed = false;
 
+extern "C" void nam_fx_reset(void);
+extern "C" void nam_fx_process(int32_t* out, const int32_t* in, int frames);
+
 static inline int32_t f32_to_q31(float x) {
     x *= NAM_OUTPUT_GAIN;
     if (x >= 1.0f) return 0x7FFFFFFF;
@@ -72,6 +75,35 @@ extern "C" void nam_fx_init(void) {
     g_front = nam::wavenet::a2_fast::partition_create(w, 48000.0, NFRAMES);
     g_back = nam::wavenet::a2_fast::partition_create(w, 48000.0, NFRAMES);
     multicore_launch_core1(core1_worker);
+}
+
+// Prime both partition handles with silence before the codec starts. A high
+// gain capture can expose the model's zero-history startup transient as an
+// audible tone if the first live block arrives immediately after init.
+extern "C" void nam_fx_warmup(int blocks) {
+    static int32_t silence[NFRAMES * 2] = {};
+    static int32_t discard[NFRAMES * 2];
+    for (int i = 0; i < blocks; ++i)
+        nam_fx_process(discard, silence, NFRAMES);
+}
+
+// Replace both partition handles with weights supplied by the WebUSB vendor
+// endpoint.  The caller parks core1 before entering this function.
+extern "C" bool nam_fx_load_weights(const float* weights, size_t count) {
+    // A2 Nano has a fixed 1871-float layout.  Creating replacement handles
+    // alongside the two live handles needs > 660 KB and exhausts Pico 2 SRAM.
+    // Reload the coefficients into the already allocated handles instead.
+    if (!weights || count != nam_model_weights_len || !g_front || !g_back)
+        return false;
+    try {
+        std::vector<float> w(weights, weights + count);
+        nam::wavenet::a2_fast::partition_reload(g_front, w, 48000.0, NFRAMES);
+        nam::wavenet::a2_fast::partition_reload(g_back, w, 48000.0, NFRAMES);
+        nam_fx_reset();
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 extern "C" const char* fx_name(void) { return "Pico NAM"; }

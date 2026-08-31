@@ -1,0 +1,33 @@
+;
+; Full-duplex I2S master adapted from the proven Arduino-Pico pio_i2s_inout
+; implementation (which is based on MicroPython's RP2 I2S driver).
+;
+; sideset pin 0 = BCLK, pin 1 = LRCLK
+; OUT = DACDAT, IN = ADCDAT, 16 bits per channel
+; Y must be initialized to bits_per_sample - 2 (14).
+; Autopull/autopush must both be enabled at 32 bits, MSB first.
+;
+.program wm8960_duplex
+.side_set 2
+
+    ; Align the first input bit one BCLK after LRCLK (known-good WM8960 path).
+    in pins, 1              side 0b01
+
+.wrap_target
+    mov x, y                side 0b01
+
+left_bits:
+    out pins, 1             side 0b00 [1]
+    in pins, 1              side 0b01
+    jmp x-- left_bits       side 0b01
+    out pins, 1             side 0b10 [1]
+    in pins, 1              side 0b11
+    mov x, y                side 0b11
+
+right_bits:
+    out pins, 1             side 0b10 [1]
+    in pins, 1              side 0b11
+    jmp x-- right_bits      side 0b11
+    out pins, 1             side 0b00 [1]
+    in pins, 1              side 0b01
+.wrap

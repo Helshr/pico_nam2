@@ -1,0 +1,25 @@
+;
+; 16-bit stereo I2S receiver and clock generator.
+; This mirrors Raspberry Pi's official pico_audio_i2s transmit timing, but
+; samples ADCDAT on each BCLK rising edge.  The WM8960 is the I2S slave.
+;
+; sideset pin 0 = BCLK, pin 1 = LRCLK
+; input pin = WM8960 ADCDAT
+; Autopush must be enabled at 32 bits and the input shifts MSB first.
+;
+.program wm8960_rx
+.side_set 2
+
+left_bits:
+    in pins, 1              side 0b11
+    jmp x-- left_bits       side 0b10
+    in pins, 1              side 0b01
+    set x, 14               side 0b00
+
+right_bits:
+    in pins, 1              side 0b01
+    jmp x-- right_bits      side 0b00
+    in pins, 1              side 0b11
+
+public entry_point:
+    set x, 14               side 0b10

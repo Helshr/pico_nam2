@@ -14,11 +14,14 @@
 #define USB_PID                                                                            \
     (0x4000 | _PID_MAP(CDC, 0) | _PID_MAP(MSC, 1) | _PID_MAP(HID, 2) | _PID_MAP(MIDI, 3) | \
      _PID_MAP(AUDIO, 4) | _PID_MAP(VENDOR, 5))
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_AUDIO * TUD_AUDIO_INTERFACE_STEREO_DESC_LEN)
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_AUDIO * TUD_AUDIO_INTERFACE_STEREO_DESC_LEN + CFG_TUD_CDC * TUD_CDC_DESC_LEN)
 
 #define EPNUM_AUDIO_IN 0x01
 #define EPNUM_AUDIO_OUT 0x01
 #define EPNUM_AUDIO_INT 0x02
+#define EPNUM_CDC_NOTIF 0x83
+#define EPNUM_CDC_OUT 0x04
+#define EPNUM_CDC_IN 0x84
 
 enum {
     STRID_LANGID = 0,
@@ -52,7 +55,9 @@ uint8_t const desc_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
     // Audio: string index of AC interface, EP Out & EP In address, EP int address
     TUD_AUDIO_INTERFACE_STEREO_DESCRIPTOR(STRID_PRODUCT, EPNUM_AUDIO_OUT, EPNUM_AUDIO_IN | 0x80,
-                                          EPNUM_AUDIO_INT | 0x80)};
+                                          EPNUM_AUDIO_INT | 0x80),
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 0, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64)};
+TU_VERIFY_STATIC(sizeof(desc_configuration) == CONFIG_TOTAL_LEN, "Incorrect UAC2 configuration descriptor length");
 
 char const *string_desc_arr[] = {
     (const char[]){0x09, 0x04},  // 0: is supported language is English (0x0409)
@@ -86,6 +91,7 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
     (void)index;
     return desc_configuration;
 }
+
 
 uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     (void)langid;

@@ -18,12 +18,17 @@
 #include "tusb.h"
 
 #include "usb_descriptors.h"
+
+#ifndef NAM_RUNTIME_SYS_KHZ
+#define NAM_RUNTIME_SYS_KHZ 300000
+#endif
 #include "bootsel_button.h"
 
 // NAM effect (C++), C-linkage.
 void nam_fx_init(void);
 void nam_fx_process(int32_t* out, const int32_t* in, int frames);
 void nam_fx_reset(void);
+bool nam_fx_load_weights(const float* weights, size_t count);
 
 #define FRAME_LENGTH 48                            // NAM block = 48 stereo frames
 #define BYTES_PER_FRAME (2 * (int)sizeof(int32_t)) // 2ch * 4B (32-bit PCM slots)
@@ -32,6 +37,70 @@ void nam_fx_reset(void);
 static int32_t scratch_in[FRAME_LENGTH * 2];
 static int32_t scratch_out[FRAME_LENGTH * 2];
 static volatile bool g_active = false; // NAM on / bypass
+
+// WebUSB upload format: 16-byte little-endian header "NAMW", version, weight
+// count and payload byte count, followed by float32 A2-Lite weights.
+#define NAM_UPLOAD_MAX_WEIGHTS 8192u
+static float upload_weights[NAM_UPLOAD_MAX_WEIGHTS];
+static uint8_t upload_header[16];
+static uint32_t upload_header_len = 0;
+static uint32_t upload_count = 0;
+static uint32_t upload_bytes = 0;
+static uint32_t upload_received = 0;
+static bool upload_in_progress = false;
+static uint32_t upload_last_ms = 0;
+
+static void vendor_reply(const char* msg) {
+    if (tud_cdc_connected()) {
+        tud_cdc_write_str(msg);
+        tud_cdc_write_str("\n");
+        tud_cdc_write_flush();
+    }
+}
+
+static void vendor_task(void) {
+    const uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (upload_in_progress && now - upload_last_ms > 5000u) {
+        upload_in_progress = false;
+        upload_header_len = upload_received = 0;
+        vendor_reply("ERR:TIMEOUT");
+    }
+
+    uint8_t buf[64];
+    while (tud_cdc_available()) {
+        uint32_t n = tud_cdc_read(buf, sizeof(buf));
+        upload_last_ms = now;
+        for (uint32_t i = 0; i < n; ++i) {
+            uint8_t b = buf[i];
+            if (!upload_in_progress) {
+                upload_header[upload_header_len++] = b;
+                if (upload_header_len < sizeof(upload_header)) continue;
+                if (memcmp(upload_header, "NAMW", 4) != 0 || upload_header[4] != 1) {
+                    vendor_reply("ERR:HEADER"); upload_header_len = 0; continue;
+                }
+                memcpy(&upload_count, upload_header + 8, 4);
+                memcpy(&upload_bytes, upload_header + 12, 4);
+                if (upload_count == 0 || upload_count > NAM_UPLOAD_MAX_WEIGHTS || upload_bytes != upload_count * 4u) {
+                    vendor_reply("ERR:SIZE"); upload_header_len = 0; continue;
+                }
+                upload_received = 0; upload_in_progress = true; upload_header_len = 0;
+                continue;
+            }
+            if (upload_received < upload_bytes) {
+                ((uint8_t*)upload_weights)[upload_received++] = b;
+            }
+            if (upload_received == upload_bytes) {
+                g_active = false;
+                board_led_write(false);
+                multicore_lockout_start_blocking();
+                bool ok = nam_fx_load_weights(upload_weights, upload_count);
+                multicore_lockout_end_blocking();
+                vendor_reply(ok ? "OK:MODEL" : "ERR:MODEL");
+                upload_in_progress = false; upload_header_len = 0;
+            }
+        }
+    }
+}
 
 // SPSC staging ring (processed stereo frames). Producer = main loop (audio_task);
 // consumer = the per-SOF USB ISR (tud_audio_tx_done_isr). Both run on core0, so a
@@ -84,11 +153,13 @@ bool tud_audio_tx_done_isr(uint8_t rhport, uint16_t n_bytes_sent, uint8_t func_i
         txr_r += FRAME_LENGTH;
         tx_last[0] = pkt[2 * (FRAME_LENGTH - 1)];
         tx_last[1] = pkt[2 * (FRAME_LENGTH - 1) + 1];
-    } else { // underrun: hold the last sample
+    } else { // underrun: ramp the last sample to silence (never hold loud DC)
         for (int k = 0; k < FRAME_LENGTH; k++) {
-            pkt[2 * k] = tx_last[0];
-            pkt[2 * k + 1] = tx_last[1];
+            const int32_t gain = FRAME_LENGTH - 1 - k;
+            pkt[2 * k] = (int32_t)(((int64_t)tx_last[0] * gain) / FRAME_LENGTH);
+            pkt[2 * k + 1] = (int32_t)(((int64_t)tx_last[1] * gain) / FRAME_LENGTH);
         }
+        tx_last[0] = tx_last[1] = 0;
     }
     tud_audio_write((uint8_t*)pkt, BLOCK_BYTES);
     return true;
@@ -97,13 +168,17 @@ bool tud_audio_tx_done_isr(uint8_t rhport, uint16_t n_bytes_sent, uint8_t func_i
 // Main-loop producer: drain whole 48-frame blocks off the OUT (speaker) FIFO, run
 // NAM (or pass through), and stage them for the per-SOF ISR to deliver.
 void audio_task(void) {
-    if (!g_mic_streaming)
-        return; // host not capturing: leave the OUT FIFO for TinyUSB to recycle
-
-    while (tud_audio_available() >= BLOCK_BYTES &&
-           (TX_RING_FRAMES - (txr_w - txr_r)) >= FRAME_LENGTH) {
+    // Always drain the speaker OUT FIFO. If we wait for the host to open the
+    // mic IN stream first, CoreAudio can deadlock while starting the duplex
+    // device: OUT waits for firmware reads while IN waits for OUT to start.
+    while (tud_audio_available() >= BLOCK_BYTES) {
+        if (g_mic_streaming &&
+            (TX_RING_FRAMES - (txr_w - txr_r)) < FRAME_LENGTH)
+            break;
         if (tud_audio_read(scratch_in, BLOCK_BYTES) != BLOCK_BYTES)
             break;
+        if (!g_mic_streaming)
+            continue;
         if (g_active)
             nam_fx_process(scratch_out, scratch_in, FRAME_LENGTH);
         else
@@ -135,20 +210,25 @@ static void button_task(void) {
 
 int main(void) {
     // Overclock to 300 MHz (2x the 150 MHz default) for dual-core pipeline headroom.
+#ifndef NAM_SKIP_CLOCK_SETUP
     vreg_set_voltage(VREG_VOLTAGE_1_20);
     sleep_ms(10);
-    set_sys_clock_khz(300000, true);
+    set_sys_clock_khz(NAM_RUNTIME_SYS_KHZ, true);
+#endif
 
     board_init();
     tusb_rhport_init_t dev_init = {.role = TUSB_ROLE_DEVICE, .speed = TUSB_SPEED_AUTO};
     tusb_init(BOARD_TUD_RHPORT, &dev_init);
     board_init_after_tusb();
 
+#ifndef NAM_SKIP_MODEL_INIT
     nam_fx_init();          // create models + launch core1 front worker
+#endif
     board_led_write(false); // effect starts bypassed (LED off)
 
     while (1) {
         tud_task();
+        vendor_task();
         audio_task();
         button_task();
     }

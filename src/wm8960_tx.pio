@@ -1,0 +1,24 @@
+;
+; 16-bit stereo I2S transmitter, adapted from Raspberry Pi's official
+; pico-extras pico_audio_i2s PIO program.
+;
+; sideset pin 0 = BCLK, pin 1 = LRCLK
+; FIFO word = [WS=0 sample:16][WS=1 sample:16]
+; Autopull must be enabled at 32 bits and the output shift is MSB first.
+;
+.program wm8960_tx
+.side_set 2
+
+left_bits:
+    out pins, 1             side 0b10
+    jmp x-- left_bits       side 0b11
+    out pins, 1             side 0b00
+    set x, 14               side 0b01
+
+right_bits:
+    out pins, 1             side 0b00
+    jmp x-- right_bits      side 0b01
+    out pins, 1             side 0b10
+
+public entry_point:
+    set x, 14               side 0b11
