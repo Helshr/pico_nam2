@@ -17,7 +17,10 @@ import sys
 import tempfile
 import termios
 import time
+import wave
 from pathlib import Path
+
+from compare_audio_intervals import compare_audio
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -245,6 +248,18 @@ def main():
         action="store_true",
         help="不轮询 Pico LEVEL（仅录音）",
     )
+    parser.add_argument(
+        "--reference",
+        type=Path,
+        default=None,
+        help="录音完成后逐区间对比的参考 WAV；省略则只录音",
+    )
+    parser.add_argument(
+        "--compare-block-ms",
+        type=float,
+        default=100.0,
+        help="参考对比的区间长度，默认 100ms",
+    )
     args = parser.parse_args()
 
     if not all((SWITCH, FFPLAY, FFMPEG)):
@@ -368,6 +383,21 @@ def main():
                 f"peak={peak if peak is not None else 'n/a'} dB"
             )
             print(f"诊断：{classify_level(mean, peak)}")
+        if args.reference:
+            reference = args.reference.expanduser().resolve()
+            if not reference.is_file():
+                print(f"参考 WAV 不存在，跳过逐区间对比：{reference}")
+            else:
+                print("开始逐区间对比参考 WAV（包含缺失尾段和静音噪声）…")
+                try:
+                    compare_audio(
+                        reference,
+                        recorded,
+                        block_ms=args.compare_block_ms,
+                        channel="left",
+                    )
+                except (OSError, ValueError, wave.Error) as exc:
+                    print(f"参考对比失败：{exc}")
     else:
         print("没有生成录音文件，链路可能没有起来。")
 
