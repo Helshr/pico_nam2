@@ -1,4 +1,7 @@
 /build/
+/build-*/
+/.tools/
+/tmp/
 *.uf2
 *.elf.map
 .DS_Store

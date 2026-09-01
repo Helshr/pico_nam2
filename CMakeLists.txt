@@ -116,7 +116,10 @@ pico_generate_pio_header(pico_wm8978_nam_blockqueue ${CMAKE_CURRENT_LIST_DIR}/sr
 target_include_directories(pico_wm8978_nam_blockqueue PRIVATE
   ${CMAKE_CURRENT_BINARY_DIR}/generated include src)
 target_compile_definitions(pico_wm8978_nam_blockqueue PRIVATE
-  NAM_OUTPUT_GAIN=0.25f WM8978_CONTROL_USB=1)
+  # Match the reference render (input 0.5, model output 0.65).  The previous
+  # 0.25 value made the embedded result over 8 dB quieter than the known-good
+  # FretFlow reference and made comparison misleading.
+  NAM_OUTPUT_GAIN=0.65f WM8978_CONTROL_USB=1)
 target_link_libraries(pico_wm8978_nam_blockqueue
   ${NAM_ENGINE_OPT} pico_stdlib pico_multicore cmsis_core
   hardware_clocks hardware_vreg hardware_i2c hardware_pio hardware_dma tinyusb_device tinyusb_board)

@@ -293,6 +293,11 @@ static void play_melody(PIO pio, uint sm) {
 
 int main(void) {
     set_sys_clock_khz(SYS_CLOCK_KHZ, true);
+    // Bring up CDC before touching I2C so a wiring/configuration failure is
+    // observable instead of trapping in the pre-stdio error loop.
+    stdio_init_all();
+    sleep_ms(500);
+    printf("WM8978 diagnostic starting\n");
     PIO pio = pio0;
     mclk_init(pio);
     sleep_ms(100);
@@ -304,7 +309,6 @@ int main(void) {
     gpio_pull_up(I2C_SCL_PIN);
 
     const bool codec_ok = wm8978_init_playback();
-    stdio_init_all();
     if (!codec_ok) {
         while (true) {
             printf("ERROR: WM8978 did not acknowledge I2C at 0x1A\n");

@@ -7,6 +7,7 @@
 
 import argparse
 import fcntl
+import glob
 import os
 import re
 import shutil
@@ -14,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 from pathlib import Path
 
@@ -152,6 +154,54 @@ def classify_level(mean, peak):
     return "有效音频电平"
 
 
+def default_mcu_port():
+    """Return the first Pico CDC device, if one is currently enumerated."""
+    ports = sorted(glob.glob("/dev/cu.usbmodem*"))
+    return ports[0] if ports else None
+
+
+def open_mcu_level_port(port):
+    """Open and configure the Pico CDC port once for the whole test."""
+    try:
+        fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        attrs = termios.tcgetattr(fd)
+        attrs[0] = 0
+        attrs[1] = 0
+        attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+        attrs[3] = 0
+        attrs[4] = termios.B115200
+        attrs[5] = termios.B115200
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        return fd
+    except (OSError, termios.error):
+        os.close(fd)
+        return None
+
+
+def read_mcu_level(fd):
+    """Read one LEVEL snapshot without requiring pyserial."""
+    try:
+        os.write(fd, b"LEVEL\n")
+        deadline = time.monotonic() + 0.25
+        data = b""
+        while time.monotonic() < deadline:
+            try:
+                data += os.read(fd, 4096)
+            except BlockingIOError:
+                pass
+            if b"\n" in data:
+                break
+            time.sleep(0.02)
+        text = data.decode(errors="replace")
+        match = re.search(r"(?:ADC_PEAK\s+\d+\s+RMS\s+\d+.*|L=\d+/\d+\s+R=\d+/\d+.*)", text)
+        return match.group(0).strip() if match else None
+    except OSError:
+        return None
+
+
 def main():
     lock = acquire_single_instance_lock()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
@@ -185,6 +235,16 @@ def main():
         default=DEFAULT_DEVICE,
         help="macOS 输入设备名",
     )
+    parser.add_argument(
+        "--mcu-port",
+        default=default_mcu_port(),
+        help="Pico CDC 端口；默认自动使用 /dev/cu.usbmodem*",
+    )
+    parser.add_argument(
+        "--no-level-poll",
+        action="store_true",
+        help="不轮询 Pico LEVEL（仅录音）",
+    )
     args = parser.parse_args()
 
     if not all((SWITCH, FFPLAY, FFMPEG)):
@@ -197,6 +257,7 @@ def main():
     old_out, old_in = current("output"), current("input")
     capture = None
     playback = None
+    mcu_fd = None
     recorded = Path(tempfile.mktemp(prefix="ixo12_wm8978_", suffix=".wav"))
     try:
         # 某些 macOS 音频设备在切换输入时会自动重置输出；最后再设置输出，
@@ -213,7 +274,13 @@ def main():
         print(f"输入设备：{args.input_device}")
         print(f"播放文件：{audio_path}")
         print(f"录音文件：{recorded}")
-        print("先把 IXO12 的输入增益放低，再开始。")
+        print("先把 IXO12 的输入增益放低，并确认 MONITOR/Loopback 已关闭，再开始。")
+        if args.mcu_port and not args.no_level_poll:
+            mcu_fd = open_mcu_level_port(args.mcu_port)
+            if mcu_fd is None:
+                print(f"Pico LEVEL 无法打开：{args.mcu_port}")
+            else:
+                print(f"Pico LEVEL 轮询：{args.mcu_port}（测试期间保持单一串口连接）")
 
         capture = subprocess.Popen(
             [
@@ -267,6 +334,13 @@ def main():
             start_new_session=True,
         )
 
+        next_level = time.monotonic()
+        while playback.poll() is None:
+            if mcu_fd is not None and time.monotonic() >= next_level:
+                level = read_mcu_level(mcu_fd)
+                print(f"MCU {level or 'LEVEL 无响应'}", flush=True)
+                next_level = time.monotonic() + 0.6
+            time.sleep(0.05)
         playback.wait()
         capture.wait()
     except KeyboardInterrupt:
@@ -274,6 +348,8 @@ def main():
     finally:
         stop_process(playback)
         stop_process(capture)
+        if mcu_fd is not None:
+            os.close(mcu_fd)
         try:
             set_device(old_out, "output")
             set_device(old_in, "input")

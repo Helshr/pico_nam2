@@ -5,8 +5,10 @@
 // a slot is either owned by DMA or contains one complete immutable block.
 // That is the same block ownership model used by the proven USB NAM path.
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 #include "tusb.h"
 #include "bsp/board_api.h"
@@ -43,8 +45,10 @@ void nam_fx_reset(void);
 #define FRAMES_PER_BLOCK 48u
 #define BLOCK_COUNT 8u
 #define NAM_INPUT_ATTENUATION 0.5f
-#define NAM_GATE_PEAK 16
-#define NAM_GATE_ATTACK_BLOCKS 4u // 4 ms debounce; DI/WAV levels can be small
+#define NAM_GATE_PEAK 1000
+#define NAM_GATE_ACTIVE_SAMPLES 8u
+#define NAM_INPUT_CLIP_RMS 28000u
+#define NAM_GATE_ATTACK_BLOCKS 4u // 4 ms debounce; preserve the tested guitar level
 #define NAM_GATE_HOLD_BLOCKS 96u   // retain a natural ~96 ms note tail
 #define NAM_REPRIME_BLOCKS 160u
 
@@ -62,20 +66,49 @@ static volatile uint32_t tx_done_count;
 static volatile uint32_t rx_started_count;
 static volatile uint32_t tx_started_count;
 static volatile bool queue_fault;
+static volatile uint32_t tx_underrun_count;
 
 static PIO audio_pio;
 static uint audio_sm;
 static volatile bool nam_enabled = true;
 static volatile bool tx_diag;
+static volatile bool tx_nam_diag;
 static uint32_t rx_read_count;
 static uint32_t tx_write_count;
 static uint32_t reprime_blocks;
 static uint32_t nam_gate_attack;
 static uint32_t nam_gate_hold;
 static bool nam_gate_open;
+static volatile uint32_t adc_peak_last;
+static volatile uint32_t adc_nonzero_last;
+static volatile uint32_t adc_active_last;
+static volatile uint32_t adc_rms_last;
+static volatile uint32_t adc_right_peak_last;
+static volatile uint32_t adc_right_rms_last;
+
+static uint32_t isqrt_u64(uint64_t x) {
+    uint64_t res = 0;
+    uint64_t bit = (uint64_t)1 << 62;
+    while (bit > x) bit >>= 2;
+    while (bit) {
+        if (x >= res + bit) {
+            x -= res + bit;
+            res = (res >> 1) + bit;
+        } else {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (uint32_t)res;
+}
 
 static void set_nam_enabled(bool enabled) {
     nam_enabled = enabled;
+    // A normal mode change always exits one-shot transport diagnostics.  In
+    // particular, NAMDIG must not survive a later NAM/BYPASS command and
+    // leave the ADC producer apparently idle while the synthetic path runs.
+    tx_diag = false;
+    tx_nam_diag = false;
     if (enabled) {
         nam_fx_reset();
         reprime_blocks = NAM_REPRIME_BLOCKS;
@@ -106,6 +139,10 @@ static bool wm8978_init_line_path(void) {
     if (!write_checked(0, 0x000)) return false;
     sleep_ms(50);
     if (!write_checked(1, 0x01b)) return false;
+    // Use the exact LINE IN route from the saved working WM8978 path.  The
+    // module's 3.5 mm jack is wired to L2/R2 and does not populate a
+    // microphone differential pair; enabling the mic PGA route here causes
+    // a floating input to be amplified as buzz.
     if (!write_checked(2, 0x1b3)) return false;
     if (!write_checked(3, 0x06f)) return false;
     if (!write_checked(4, 0x010)) return false; // I2S, 16-bit, slave
@@ -113,15 +150,19 @@ static bool wm8978_init_line_path(void) {
     if (!write_checked(10, 0x008)) return false;
     if (!write_checked(11, 0x000)) return false; // DAC mute during startup
     if (!write_checked(12, 0x100)) return false;
+    // Keep the ADC high-pass enabled (HPFEN=1) so the line-input bias/Vmid
+    // cannot appear as a large DC sample block; ADCOSR=1 selects 128x OSR.
     if (!write_checked(14, 0x108)) return false;
     if (!write_checked(15, 0x0ff)) return false;
     if (!write_checked(16, 0x1ff)) return false;
     if (!write_checked(43, 0x010)) return false;
+    // Disable the unused microphone PGAs and use the dedicated L2/R2 line
+    // boost setting from the baseline (0 dB, unmuted).
     if (!write_checked(44, 0x000)) return false;
     if (!write_checked(45, 0x040)) return false;
     if (!write_checked(46, 0x140)) return false;
-    if (!write_checked(47, 0x140)) return false; // L2 line input
-    if (!write_checked(48, 0x140)) return false; // R2 line input
+    if (!write_checked(47, 0x140)) return false;
+    if (!write_checked(48, 0x140)) return false;
     if (!write_checked(49, 0x002)) return false;
     if (!write_checked(50, 0x001)) return false; // DAC -> output mixer
     if (!write_checked(51, 0x001)) return false;
@@ -184,7 +225,20 @@ static void __isr audio_dma_irq(void) {
         // here: the IRQ can race with the producer's next full-block write,
         // and clearing it concurrently can erase only the low 16 bits (right
         // I2S channel), which manifests as a disappearing right channel.
-        const uint slot = tx_started_count++ & (BLOCK_COUNT - 1u);
+        const uint32_t next = tx_started_count++;
+        const uint slot = next & (BLOCK_COUNT - 1u);
+        // If the NAM producer has not prepared this sequence number yet,
+        // reserve it as an explicit silent block.  Reading the previous
+        // contents here repeats stale samples and is the source of the
+        // intermittent buzz seen when inference briefly misses a deadline.
+        // Advancing tx_write_count reserves the slot so the producer cannot
+        // overwrite it while DMA is consuming the silence block.
+        if (tx_write_count <= next) {
+            memset(tx_blocks[slot], 0, sizeof(tx_blocks[slot]));
+            tx_write_count = next + 1u;
+            ++tx_underrun_count;
+            queue_fault = true;
+        }
         dma_channel_set_read_addr(tx_dma, tx_blocks[slot], false);
         dma_channel_set_trans_count(tx_dma, FRAMES_PER_BLOCK, true);
     }
@@ -223,6 +277,66 @@ static inline int16_t sat16(int32_t v) {
 static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
     static int32_t in[FRAMES_PER_BLOCK * 2];
     static int32_t out[FRAMES_PER_BLOCK * 2];
+    static uint32_t nam_diag_phase;
+
+    // Keep a cheap, race-safe snapshot for USB diagnostics.  This observes
+    // the raw left I2S slot before the gate/NAM path, so LEVEL distinguishes
+    // an ADC framing/input problem from an inference/output problem.
+    uint32_t raw_peak = 0;
+    uint32_t raw_right_peak = 0;
+    uint32_t raw_nonzero = 0;
+    uint32_t raw_active = 0;
+    uint64_t raw_energy = 0;
+    uint64_t raw_right_energy = 0;
+    int64_t raw_sum = 0;
+    for (uint i = 0; i < FRAMES_PER_BLOCK; ++i) {
+        const int32_t v = (int16_t)(rx[i] >> 16);
+        const int32_t r = (int16_t)rx[i];
+        const uint32_t a = (uint32_t)(v < 0 ? -v : v);
+        const uint32_t ra = (uint32_t)(r < 0 ? -r : r);
+        raw_sum += v;
+        if (a > raw_peak) raw_peak = a;
+        if (ra > raw_right_peak) raw_right_peak = ra;
+        if (a != 0) ++raw_nonzero;
+        if (a >= NAM_GATE_PEAK) ++raw_active;
+        // Cast to signed 64-bit before multiplying; converting a negative
+        // sample directly to uint64_t would turn a quiet signal into a huge
+        // diagnostic energy value.
+        raw_energy += (uint64_t)((int64_t)v * (int64_t)v);
+        raw_right_energy += (uint64_t)((int64_t)r * (int64_t)r);
+    }
+    adc_peak_last = raw_peak;
+    adc_nonzero_last = raw_nonzero;
+    adc_active_last = raw_active;
+    adc_rms_last = isqrt_u64(raw_energy / FRAMES_PER_BLOCK);
+    adc_right_peak_last = raw_right_peak;
+    adc_right_rms_last = isqrt_u64(raw_right_energy / FRAMES_PER_BLOCK);
+    // A sustained full-scale ADC block is not useful guitar content.  In the
+    // IXO12 self-test it indicates an analogue direct-monitor feedback loop;
+    // feeding that back into a high-gain NAM would immediately create a
+    // buzzer and keep the loop latched.  Drop the block and re-prime instead.
+    const bool input_overload = adc_rms_last >= NAM_INPUT_CLIP_RMS;
+
+    if (tx_nam_diag) {
+        // Runtime NAM transport diagnostic: synthesize a modest 440 Hz input
+        // in the same Q31 format as the ADC path, then run the real model.
+        // This isolates inference/DAC from the analogue input and PIO RX.
+        for (uint i = 0; i < FRAMES_PER_BLOCK; ++i) {
+            const float phase = (float)nam_diag_phase *
+                                (6.28318530718f / 4294967296.0f);
+            const int16_t s = (int16_t)(5000.0f * sinf(phase));
+            nam_diag_phase += 39370534u;
+            const int32_t q = (int32_t)((float)s * 65536.0f);
+            in[2 * i] = q;
+            in[2 * i + 1] = q;
+        }
+        nam_fx_process(out, in, FRAMES_PER_BLOCK);
+        for (uint i = 0; i < FRAMES_PER_BLOCK; ++i) {
+            const int16_t v = sat16(out[2 * i] >> 16);
+            tx_blocks[tx_slot][i] = ((uint32_t)(uint16_t)v << 16) | (uint16_t)v;
+        }
+        return;
+    }
 
     if (tx_diag) {
         static uint32_t phase;
@@ -243,18 +357,33 @@ static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
         return;
     }
 
-    const bool silent_reprime = reprime_blocks != 0;
+    const int32_t dc = (int32_t)(raw_sum / (int64_t)FRAMES_PER_BLOCK);
+    if (input_overload) {
+        nam_gate_open = false;
+        nam_gate_attack = 0;
+        nam_gate_hold = 0;
+        reprime_blocks = NAM_REPRIME_BLOCKS;
+    }
+    const bool silent_reprime = reprime_blocks != 0 || input_overload;
     int peak = 0;
+    uint active_samples = 0;
     if (!silent_reprime) {
         for (uint i = 0; i < FRAMES_PER_BLOCK; ++i) {
-            const int v = (int16_t)(rx[i] >> 16);
+            // Remove the codec's block-level input bias before the gate and
+            // NAM.  It prevents a floating LINE IN/DC offset from opening a
+            // high-gain model, while leaving normal guitar AC content intact.
+            const int v = (int16_t)(rx[i] >> 16) - dc;
             const int a = v < 0 ? -v : v;
             if (a > peak) peak = a;
+            if (a >= NAM_GATE_PEAK) ++active_samples;
         }
         // A cable/static burst with the guitar volume closed is often several
         // milliseconds long. Require a real 24 ms musical envelope before
         // the high-gain model receives signal.
-        if (peak >= NAM_GATE_PEAK) {
+        // A single misframed/analogue ADC spike must not open the high-gain
+        // model. Real guitar content occupies several consecutive samples;
+        // sparse spikes are treated as silence and never become a buzzer.
+        if (peak >= NAM_GATE_PEAK && active_samples >= NAM_GATE_ACTIVE_SAMPLES) {
             if (nam_gate_attack < NAM_GATE_ATTACK_BLOCKS) ++nam_gate_attack;
             nam_gate_hold = NAM_GATE_HOLD_BLOCKS;
             if (nam_gate_attack == NAM_GATE_ATTACK_BLOCKS) nam_gate_open = true;
@@ -270,7 +399,8 @@ static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
     }
     const bool gate_closed = !nam_gate_open;
     for (uint i = 0; i < FRAMES_PER_BLOCK; ++i) {
-        const int16_t s = (silent_reprime || gate_closed) ? 0 : (int16_t)(rx[i] >> 16);
+        const int16_t s = (silent_reprime || gate_closed) ? 0 :
+                          sat16((int16_t)(rx[i] >> 16) - dc);
         const int32_t q = (int32_t)((float)s * NAM_INPUT_ATTENUATION * 65536.0f);
         in[2 * i] = q;
         in[2 * i + 1] = q;
@@ -353,9 +483,39 @@ static void usb_control_task(void) {
         tud_cdc_write_str("OK BYPASS\n");
     } else if (!strcmp(command, "STATUS")) {
         tud_cdc_write_str(nam_enabled ? "NAM\n" : "BYPASS\n");
+    } else if (!strcmp(command, "LEVEL")) {
+        // Keep the diagnostic line below one USB CDC packet.  A long
+        // human-readable line was frequently observed only as a truncated
+        // prefix by terminal clients, hiding the underrun counter.
+        char reply[128];
+        snprintf(reply, sizeof(reply), "L=%lu/%lu R=%lu/%lu A=%lu N=%lu O=%u F=%u U=%lu C=%lu/%lu/%lu/%lu\n",
+                 (unsigned long)adc_peak_last,
+                 (unsigned long)adc_rms_last,
+                 (unsigned long)adc_right_peak_last,
+                 (unsigned long)adc_right_rms_last,
+                 (unsigned long)adc_active_last,
+                 (unsigned long)adc_nonzero_last,
+                 adc_rms_last >= NAM_INPUT_CLIP_RMS ? 1u : 0u,
+                 queue_fault ? 1u : 0u,
+                 (unsigned long)tx_underrun_count,
+                 (unsigned long)rx_done_count,
+                 (unsigned long)tx_done_count,
+                 (unsigned long)rx_read_count,
+                 (unsigned long)tx_write_count);
+        tud_cdc_write_str(reply);
     } else if (!strcmp(command, "DIAG")) {
         tx_diag = true;
         tud_cdc_write_str("OK DIAG\n");
+    } else if (!strcmp(command, "NAMDIG")) {
+        tx_diag = false;
+        tx_nam_diag = true;
+        nam_enabled = true;
+        reprime_blocks = 0;
+        nam_gate_attack = NAM_GATE_ATTACK_BLOCKS;
+        nam_gate_open = true;
+        nam_fx_reset();
+        board_led_write(true);
+        tud_cdc_write_str("OK NAMDIG\n");
     } else if (!strcmp(command, "BOOTLOADER")) {
         tud_cdc_write_str("OK BOOTLOADER\n");
         tud_cdc_write_flush();
