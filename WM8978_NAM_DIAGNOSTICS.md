@@ -84,3 +84,25 @@ Mac 耳机输出发送，WM8978 ADC 都没有收到稳定的连续音频；下�
 没有 USB 接口，测试后无法由电脑自动触发 BOOTSEL；下一次板子进入实体 BOOTSEL 后，必须优先恢复
 `build-pico-wm8978-blockqueue/pico_wm8978_nam_blockqueue.uf2`，再继续 NAM 对照，避免把旁路结果
 误认为 NAM 已通过。
+
+本轮正式 block-queue 固件（`NAM_GATE_ATTACK_BLOCKS=8` 后又恢复为 `4`）均已成功通过 CDC
+切换至 BOOTSEL、烧录并回报 `STATUS=NAM`。`NAMDIG` 返回 `Y≈3770--4226`，证明双核
+`nam_fx_process()` 与 I2S DAC 数字输出正常。重要环境结论：GarageBand 即使窗口看起来没有
+播放，也可能在 IXO12 上保留回环；挂起/停止 GarageBand 后，IXO12 空闲回录从满幅/−16 dBFS
+降至 −90.3 dBFS。自动测试前必须停止 GarageBand 的传输（最好退出），并关闭 IXO12 的
+MONITOR/LOOPBACK；否则比较结果会被外部反馈污染。测试脚本现会记录播放/录音子进程退出码，
+避免设备被占用时继续输出伪对比结果。
+
+进一步的 `BYPASS` 对照表明，当前某些 IXO12 电平状态下旁路仍可回录约 −14 dBFS；而
+`DIAG`（Pico 内部方波、完全绕过 ADC/NAM）回录却出现 0 dBFS 满幅随机波形。这说明
+WM8978 耳机输出到 IXO12 输入这一段的增益/监控链路仍会削顶，不能拿该状态评价 NAM
+曲线。正式固件已重新恢复并回报 `NAM`；在继续曲线实验前，必须把 IXO12 输入旋钮调至
+最小、确认 MONITOR/LOOPBACK 关闭，再用 `DIAG` 回录应呈现稳定方波，随后才测试 DI。
+
+## 2026-09-02：闭环输入定位
+
+- 正确的电脑回环设备必须是 `Steinberg IXO12` 输出和 `Steinberg IXO12` 输入；选择 `External Headphones` 会绕过 WM8978，不能用于 DI 回录。
+- 用 `DIAG` 让 Pico 生成固定方波并直接录 IXO12 输入，左声道可测到约 750 Hz（诊断方波的频率），证明 WM8978 DAC → IXO12 输入线正常；右声道当前无有效信号。
+- 切换 `BYPASS`，播放纯 440 Hz 到 IXO12 输出，再从 IXO12 输入录音：Pico `LEVEL` 只有约 300 峰值且录音频谱没有 440 Hz，说明 IXO12 输出信号没有稳定到达 WM8978 ADC（读到的是底噪/杂散），此时继续调 NAM 参数没有意义。
+- 生产固件已恢复为 `build-pico-wm8978-blockqueue/pico_wm8978_nam_blockqueue.uf2`，CDC `STATUS` 返回 `NAM`。
+- 进一步检查发现当前 macOS 已不再枚举 `Steinberg IXO12`（`SwitchAudioSource -a` 仅列出内置设备）；此前测试脚本对不存在设备会静默保持旧设备，已修复脚本为设备缺失立即报错，避免把内置麦克风/耳机数据当成 IXO12 回录。

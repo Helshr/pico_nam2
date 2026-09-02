@@ -120,6 +120,12 @@ target_compile_definitions(pico_wm8978_nam_blockqueue PRIVATE
   # 0.25 value made the embedded result over 8 dB quieter than the known-good
   # FretFlow reference and made comparison misleading.
   NAM_OUTPUT_GAIN=0.65f WM8978_CONTROL_USB=1)
+option(WM8978_NAM_DISABLE_GATE
+  "Process every non-overloaded sample for DI/reference regression" OFF)
+if(WM8978_NAM_DISABLE_GATE)
+  target_compile_definitions(pico_wm8978_nam_blockqueue PRIVATE
+    WM8978_NAM_DISABLE_GATE=1)
+endif()
 target_link_libraries(pico_wm8978_nam_blockqueue
   ${NAM_ENGINE_OPT} pico_stdlib pico_multicore cmsis_core
   hardware_clocks hardware_vreg hardware_i2c hardware_pio hardware_dma tinyusb_device tinyusb_board)

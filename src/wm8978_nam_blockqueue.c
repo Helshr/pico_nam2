@@ -43,14 +43,28 @@ void nam_fx_reset(void);
 #define SAMPLE_RATE 48000u
 
 #define FRAMES_PER_BLOCK 48u
-#define BLOCK_COUNT 8u
+// A2-Lite inference can occasionally be delayed by a flash/cache stall.  A
+// 32-block (32 ms) lead absorbs that jitter while keeping ownership explicit;
+// every slot is still a complete immutable 48-frame block.
+#define BLOCK_COUNT 32u
+// Match the known-good FretFlow render: its offline path feeds the model
+// input at 0.5.  The IXO12/WM8978 regression loop uses a conservative external
+// playback level, so this does not overdrive the codec while preserving the
+// model's intended nonlinear response.
 #define NAM_INPUT_ATTENUATION 0.5f
-#define NAM_GATE_PEAK 1000
+#define NAM_GATE_PEAK 300
 #define NAM_GATE_ACTIVE_SAMPLES 8u
 #define NAM_INPUT_CLIP_RMS 28000u
-#define NAM_GATE_ATTACK_BLOCKS 4u // 4 ms debounce; preserve the tested guitar level
+#define NAM_GATE_ATTACK_BLOCKS 4u // 4 ms debounce; reject isolated codec spikes
 #define NAM_GATE_HOLD_BLOCKS 96u   // retain a natural ~96 ms note tail
 #define NAM_REPRIME_BLOCKS 160u
+
+// Set by the candidate no-gate build while validating the DI reference path.
+// The production build keeps the gate enabled until the analogue noise floor
+// has been measured with the final cabling.
+#ifndef WM8978_NAM_DISABLE_GATE
+#define WM8978_NAM_DISABLE_GATE 0
+#endif
 
 // Every word is one 16-bit stereo I2S frame.  The PIO packs left in bits 31:16.
 static uint32_t rx_blocks[BLOCK_COUNT][FRAMES_PER_BLOCK] __aligned(4);
@@ -74,7 +88,10 @@ static volatile bool nam_enabled = true;
 static volatile bool tx_diag;
 static volatile bool tx_nam_diag;
 static uint32_t rx_read_count;
-static uint32_t tx_write_count;
+// This counter is advanced by both the main producer and the DMA ISR.  It
+// must remain volatile; otherwise an optimized build may reuse a stale value
+// and the ISR can reserve/clear a slot that the producer has just filled.
+static volatile uint32_t tx_write_count;
 static uint32_t reprime_blocks;
 static uint32_t nam_gate_attack;
 static uint32_t nam_gate_hold;
@@ -85,6 +102,13 @@ static volatile uint32_t adc_active_last;
 static volatile uint32_t adc_rms_last;
 static volatile uint32_t adc_right_peak_last;
 static volatile uint32_t adc_right_rms_last;
+static volatile uint32_t out_peak_last;
+static volatile uint32_t out_rms_last;
+static volatile bool codec_fault;
+
+// usb_control_task() is defined below main's hardware bring-up, but must also
+// remain available while a codec-init failure is reported over USB.
+static void usb_control_task(void);
 
 static uint32_t isqrt_u64(uint64_t x) {
     uint64_t res = 0;
@@ -161,6 +185,9 @@ static bool wm8978_init_line_path(void) {
     if (!write_checked(44, 0x000)) return false;
     if (!write_checked(45, 0x040)) return false;
     if (!write_checked(46, 0x140)) return false;
+    // Reuse the verified clean-bypass line-input setting.  0x140 is the
+    // WM8978 L2/R2 code used by the saved working path (-3 dB); 0x150 adds
+    // an unnecessary boost and raises the analogue noise floor before NAM.
     if (!write_checked(47, 0x140)) return false;
     if (!write_checked(48, 0x140)) return false;
     if (!write_checked(49, 0x002)) return false;
@@ -174,6 +201,7 @@ static bool wm8978_init_line_path(void) {
 static bool wm8978_unmute_dac(void) {
     return write_checked(11, 0x0ff) && write_checked(12, 0x1ff);
 }
+
 
 static void mclk_init(PIO pio) {
     const uint sm = pio_claim_unused_sm(pio, true);
@@ -274,6 +302,19 @@ static inline int16_t sat16(int32_t v) {
     return (int16_t)v;
 }
 
+static void publish_output_level(const uint32_t *block) {
+    uint32_t peak = 0;
+    uint64_t energy = 0;
+    for (uint i = 0; i < FRAMES_PER_BLOCK; ++i) {
+        const int32_t v = (int16_t)(block[i] >> 16);
+        const uint32_t a = (uint32_t)(v < 0 ? -v : v);
+        if (a > peak) peak = a;
+        energy += (uint64_t)((int64_t)v * (int64_t)v);
+    }
+    out_peak_last = peak;
+    out_rms_last = isqrt_u64(energy / FRAMES_PER_BLOCK);
+}
+
 static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
     static int32_t in[FRAMES_PER_BLOCK * 2];
     static int32_t out[FRAMES_PER_BLOCK * 2];
@@ -335,6 +376,7 @@ static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
             const int16_t v = sat16(out[2 * i] >> 16);
             tx_blocks[tx_slot][i] = ((uint32_t)(uint16_t)v << 16) | (uint16_t)v;
         }
+        publish_output_level(tx_blocks[tx_slot]);
         return;
     }
 
@@ -344,6 +386,7 @@ static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
             const int16_t v = (phase++ & 32u) ? 8192 : -8192;
             tx_blocks[tx_slot][i] = ((uint32_t)(uint16_t)v << 16) | (uint16_t)v;
         }
+        publish_output_level(tx_blocks[tx_slot]);
         return;
     }
 
@@ -354,6 +397,7 @@ static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
             const int16_t v = sat16(dry);
             tx_blocks[tx_slot][i] = ((uint32_t)(uint16_t)v << 16) | (uint16_t)v;
         }
+        publish_output_level(tx_blocks[tx_slot]);
         return;
     }
 
@@ -367,6 +411,7 @@ static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
     const bool silent_reprime = reprime_blocks != 0 || input_overload;
     int peak = 0;
     uint active_samples = 0;
+#if !WM8978_NAM_DISABLE_GATE
     if (!silent_reprime) {
         for (uint i = 0; i < FRAMES_PER_BLOCK; ++i) {
             // Remove the codec's block-level input bias before the gate and
@@ -397,7 +442,16 @@ static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
             }
         }
     }
+#endif
+#if WM8978_NAM_DISABLE_GATE
+    // The DI/reference regression build must process every non-overloaded
+    // sample, including low-level tails.  Otherwise the gate turns quiet
+    // intervals into hard zeroes and the full-interval curve cannot match the
+    // browser reference.  Overload blocks still force a silent reprime.
+    const bool gate_closed = false;
+#else
     const bool gate_closed = !nam_gate_open;
+#endif
     for (uint i = 0; i < FRAMES_PER_BLOCK; ++i) {
         const int16_t s = (silent_reprime || gate_closed) ? 0 :
                           sat16((int16_t)(rx[i] >> 16) - dc);
@@ -418,6 +472,7 @@ static void make_output_block(uint32_t tx_slot, const uint32_t *rx) {
         const int16_t right = left;
         tx_blocks[tx_slot][i] = ((uint32_t)(uint16_t)left << 16) | (uint16_t)right;
     }
+    publish_output_level(tx_blocks[tx_slot]);
 }
 
 static void audio_task(void) {
@@ -431,13 +486,13 @@ static void audio_task(void) {
             rx_read_count = produced;
             return;
         }
-        // The first six output blocks are a silence runway.  Thereafter every
+        // The first BLOCK_COUNT-2 output blocks are a silence runway.  Thereafter every
         // NAM result is written far enough ahead that DMA never reads a block
         // while core0 is modifying it.
         if (tx_write_count < tx_started_count) {
             queue_fault = true;
             rx_read_count = produced;
-            tx_write_count = tx_started_count + 6u;
+            tx_write_count = tx_started_count + (BLOCK_COUNT - 2u);
             return;
         }
         if (tx_write_count - tx_done_count >= BLOCK_COUNT) return;
@@ -482,26 +537,20 @@ static void usb_control_task(void) {
         set_nam_enabled(false);
         tud_cdc_write_str("OK BYPASS\n");
     } else if (!strcmp(command, "STATUS")) {
-        tud_cdc_write_str(nam_enabled ? "NAM\n" : "BYPASS\n");
+        tud_cdc_write_str(codec_fault ? "FAULT CODEC\n" :
+                          (nam_enabled ? "NAM\n" : "BYPASS\n"));
     } else if (!strcmp(command, "LEVEL")) {
-        // Keep the diagnostic line below one USB CDC packet.  A long
-        // human-readable line was frequently observed only as a truncated
-        // prefix by terminal clients, hiding the underrun counter.
-        char reply[128];
-        snprintf(reply, sizeof(reply), "L=%lu/%lu R=%lu/%lu A=%lu N=%lu O=%u F=%u U=%lu C=%lu/%lu/%lu/%lu\n",
+        // Keep the diagnostic line below one CDC packet.  The full queue
+        // counters are internal implementation details; ADC and output
+        // peak/RMS are the values needed to diagnose the analogue path.
+        char reply[64];
+        snprintf(reply, sizeof(reply), "L=%lu/%lu R=%lu/%lu Y=%lu/%lu\n",
                  (unsigned long)adc_peak_last,
                  (unsigned long)adc_rms_last,
                  (unsigned long)adc_right_peak_last,
                  (unsigned long)adc_right_rms_last,
-                 (unsigned long)adc_active_last,
-                 (unsigned long)adc_nonzero_last,
-                 adc_rms_last >= NAM_INPUT_CLIP_RMS ? 1u : 0u,
-                 queue_fault ? 1u : 0u,
-                 (unsigned long)tx_underrun_count,
-                 (unsigned long)rx_done_count,
-                 (unsigned long)tx_done_count,
-                 (unsigned long)rx_read_count,
-                 (unsigned long)tx_write_count);
+                 (unsigned long)out_peak_last,
+                 (unsigned long)out_rms_last);
         tud_cdc_write_str(reply);
     } else if (!strcmp(command, "DIAG")) {
         tx_diag = true;
@@ -522,12 +571,13 @@ static void usb_control_task(void) {
         sleep_ms(20);
         reset_usb_boot(0, 0);
     } else {
-        tud_cdc_write_str("ERR COMMANDS: NAM BYPASS STATUS BOOTLOADER\n");
+        tud_cdc_write_str("ERR COMMANDS: NAM BYPASS STATUS LEVEL DIAG NAMDIG BOOTLOADER\n");
     }
     tud_cdc_write_flush();
 }
 
 int main(void) {
+    board_init();
     tusb_init();
     vreg_set_voltage(VREG_VOLTAGE_1_20);
     sleep_ms(10);
@@ -540,7 +590,19 @@ int main(void) {
     gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA_PIN);
     gpio_pull_up(I2C_SCL_PIN);
-    if (!wm8978_init_line_path()) while (true) tight_loop_contents();
+    if (!wm8978_init_line_path()) {
+        // Keep CDC alive even when the codec is absent or not powered.  The
+        // previous hard loop left a USB device that enumerated but could not
+        // receive BOOTLOADER/diagnostic commands, making recovery require a
+        // physical BOOTSEL press every time.
+        codec_fault = true;
+        board_led_write(false);
+        while (true) {
+            tud_task();
+            usb_control_task();
+            tight_loop_contents();
+        }
+    }
 
     audio_sm = pio_claim_unused_sm(audio_pio, true);
     const uint offset = pio_add_program(audio_pio, &wm8960_duplex_program);
@@ -556,11 +618,11 @@ int main(void) {
     pio_sm_set_enabled(audio_pio, audio_sm, true);
     (void)pio_sm_get_blocking(audio_pio, audio_sm); // discard PIO alignment word
     audio_dma_init();
-    // Six silent blocks provide a complete immutable startup runway: NAM
+    // BLOCK_COUNT-2 silent blocks provide a complete immutable startup runway: NAM
     // starts processing only after the ADC has delivered the first full block.
     rx_started_count = 1;
     tx_started_count = 1;
-    tx_write_count = 6;
+    tx_write_count = BLOCK_COUNT - 2u;
     dma_start_channel_mask((1u << rx_dma) | (1u << tx_dma));
 
     // Feed/consume complete blocks while muted, then open the DAC after the

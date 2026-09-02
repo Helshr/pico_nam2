@@ -73,6 +73,15 @@ def set_device(name, kind):
     run(SWITCH, "-s", name, "-t", kind)
 
 
+def require_device(name, kind):
+    """Fail fast when SwitchAudioSource silently ignores an absent device."""
+    available = run(SWITCH, "-a", "-t", kind, capture=True).stdout.splitlines()
+    if name not in available:
+        raise RuntimeError(
+            f"找不到 macOS {kind} 设备：{name}；当前可用设备：{', '.join(available) or '无'}"
+        )
+
+
 def audiotoolbox_output_index(device_name):
     # AudioToolbox 在切换默认输出后可能需要数百毫秒重新枚举设备。
     # 轮询而不是固定一次探测，避免把临时的 macOS 重枚举误判为设备不存在。
@@ -88,15 +97,28 @@ def audiotoolbox_output_index(device_name):
             stderr=subprocess.PIPE,
             text=True,
         )
-        time.sleep(0.35)
-        probe.kill()
-        _, stderr = probe.communicate()
+        try:
+            time.sleep(0.35)
+            probe.kill()
+            _, stderr = probe.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            probe.kill()
+            _, stderr = probe.communicate()
         for line in stderr.splitlines():
             match = re.search(r"\[(\d+)\]", line)
-            if match and device_name in line:
+            # AudioToolbox exposes a transient ``[0] (null)`` entry while
+            # CoreAudio is re-enumerating USB devices.  Never select that
+            # entry: sending playback to it silently produces an empty
+            # hardware capture.  IXO12 normally follows it at index 1, but
+            # the index is intentionally discovered on every run.
+            if match and device_name in line and "(null)" not in line:
                 return int(match.group(1))
         time.sleep(0.15)
-    raise RuntimeError(f"AudioToolbox 找不到输出设备：{device_name}")
+    # GarageBand or another CoreAudio client can hold AudioToolbox's device
+    # enumeration open.  The caller has already selected ``device_name`` as
+    # the macOS default, so letting ffmpeg use its default is safer than
+    # aborting a capture solely because the diagnostic probe was unavailable.
+    return None
 
 
 def stop_process(process):
@@ -273,10 +295,14 @@ def main():
     capture = None
     playback = None
     mcu_fd = None
+    playback_rc = None
+    capture_rc = None
     recorded = Path(tempfile.mktemp(prefix="ixo12_wm8978_", suffix=".wav"))
     try:
         # 某些 macOS 音频设备在切换输入时会自动重置输出；最后再设置输出，
         # 避免 IXO12 被系统悄悄切回耳机。
+        require_device(args.input_device, "input")
+        require_device(args.output_device, "output")
         set_device(args.input_device, "input")
         set_device(args.output_device, "output")
 
@@ -285,7 +311,11 @@ def main():
         # 播放前再次设置，确保 DI 信号确实送入 IXO12/WM8978。
         set_device(args.output_device, "output")
         time.sleep(0.3)
-        print(f"输出设备：{args.output_device} (AudioToolbox index {output_index})")
+        print(
+            f"输出设备：{args.output_device}"
+            + (f" (AudioToolbox index {output_index})" if output_index is not None
+               else " (使用系统默认输出，索引探测被占用时的回退路径)")
+        )
         print(f"输入设备：{args.input_device}")
         print(f"播放文件：{audio_path}")
         print(f"录音文件：{recorded}")
@@ -297,6 +327,15 @@ def main():
             else:
                 print(f"Pico LEVEL 轮询：{args.mcu_port}（测试期间保持单一串口连接）")
 
+        # Start capture slightly before playback and keep it running after the
+        # source ends.  AVFoundation can otherwise close the input stream a
+        # couple of seconds early, which would be reported as missing
+        # reference intervals rather than a real audio-path failure.
+        # AVFoundation/IXO12 can spend several seconds opening the input
+        # stream before delivering its first timestamped frame.  Two seconds
+        # was insufficient and made every long comparison look like a missing
+        # tail; keep a generous post-roll and let the comparator ignore extras.
+        capture_duration = args.duration + 8.0
         capture = subprocess.Popen(
             [
                 FFMPEG,
@@ -309,7 +348,7 @@ def main():
                 "-i",
                 ":0",
                 "-t",
-                str(args.duration),
+                str(capture_duration),
                 "-ar",
                 "48000",
                 "-ac",
@@ -322,8 +361,7 @@ def main():
         )
 
         time.sleep(0.3)
-        playback = subprocess.Popen(
-            [
+        playback_command = [
                 FFMPEG,
                 "-hide_banner",
                 "-loglevel",
@@ -340,12 +378,14 @@ def main():
                 "48000",
                 "-ac",
                 "2",
-                "-audio_device_index",
-                str(output_index),
                 "-f",
                 "audiotoolbox",
                 "ixo12-wm8978-playback",
-            ],
+        ]
+        if output_index is not None:
+            playback_command[-3:-3] = ["-audio_device_index", str(output_index)]
+        playback = subprocess.Popen(
+            playback_command,
             start_new_session=True,
         )
 
@@ -357,7 +397,9 @@ def main():
                 next_level = time.monotonic() + 0.6
             time.sleep(0.05)
         playback.wait()
+        playback_rc = playback.returncode
         capture.wait()
+        capture_rc = capture.returncode
     except KeyboardInterrupt:
         pass
     finally:
@@ -372,7 +414,18 @@ def main():
             pass
         lock.close()
 
-    if recorded.exists():
+    if playback_rc not in (None, 0):
+        print(
+            f"播放进程失败（退出码 {playback_rc}）。"
+            " 请先完全退出 GarageBand/其他占用 IXO12 的程序后重试。"
+        )
+    if capture_rc not in (None, 0):
+        print(
+            f"录音进程失败（退出码 {capture_rc}）。"
+            " 请检查 IXO12 输入设备是否可用。"
+        )
+
+    if recorded.exists() and playback_rc in (None, 0) and capture_rc in (None, 0):
         mean, peak = analyze_volume(recorded)
         print("回环完成。")
         print(f"录音文件：{recorded}")
