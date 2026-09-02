@@ -398,7 +398,19 @@ def main():
             time.sleep(0.05)
         playback.wait()
         playback_rc = playback.returncode
-        capture.wait()
+        # AVFoundation occasionally leaves the capture process open after it
+        # has produced the requested post-roll.  Never let one such process
+        # block the test (and create overlapping audio processes on the next
+        # run); give it a bounded grace period, then stop its process group.
+        capture_timeout = max(10.0, args.duration + 10.0)
+        try:
+            capture.wait(timeout=capture_timeout)
+        except subprocess.TimeoutExpired:
+            print(
+                f"采集进程超过 {capture_timeout:.0f}s 未退出，正在安全停止…",
+                flush=True,
+            )
+            stop_process(capture)
         capture_rc = capture.returncode
     except KeyboardInterrupt:
         pass
